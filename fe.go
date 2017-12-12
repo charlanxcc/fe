@@ -174,7 +174,7 @@ type: timeout
   -- required: Channel, Phase
 
 
--- tracking status
+-- tracker status
   queued
   starting
   proposing
@@ -182,6 +182,7 @@ type: timeout
   committing
   committed
   canceled
+  done
 */
 
 type FeData struct {
@@ -197,7 +198,7 @@ type FeData struct {
 	Timestamp	int64		`json:"timestamp"`
 	HoldUntil	int64		`json:"hold-until"`
 
-	Tracker		func(string)
+	tracker		func(*FeData, string, error)	`json:"-"`
 }
 
 var (
@@ -462,13 +463,19 @@ func (p *Peer) clientHandler(client *Client, conn net.Conn) {
 		switch req.Type {
 		case "sync":
 			req.From = me.Id
-			defch.proc(&req, func(result *FeData) {
-				err = sendJson(conn, result)
-				if err != nil {
-					fmt.Printf("failed to send to %s: %s\n", client.Id, err)
-					return
+			req.tracker = func(data *FeData, state string, err error) {
+				rsp = req
+				rsp.State = state
+				switch state {
+				case "done": fallthrough
+				case "canceled":
+					e2 := sendJson(conn, &rsp)
+					if e2 != nil {
+						fmt.Printf("failed to send to %s: %s\n", client.Id, e2)
+					}
 				}
-			})
+			}
+			defch.putTask(&req)
 
 		case "get":
 			err = sendJson(conn, defch.data)
@@ -479,13 +486,19 @@ func (p *Peer) clientHandler(client *Client, conn net.Conn) {
 
 		case "put":
 			req.From = me.Id
-			defch.proc(&req, func(result *FeData) {
-				err = sendJson(conn, result)
-				if err != nil {
-					fmt.Printf("failed to send to %s: %s\n", client.Id, err)
-					return
+			req.tracker = func(data *FeData, state string, err error) {
+				rsp = req
+				rsp.State = state
+				switch state {
+				case "committed": fallthrough
+				case "canceled":
+					e2 := sendJson(conn, &data)
+					if e2 != nil {
+						fmt.Printf("failed to send to %s: %s\n", client.Id, e2)
+					}
 				}
-			})
+			}
+			defch.putTask(&req)
 
 		case "status":
 			rsp.Type = "data"
@@ -641,8 +654,12 @@ func status() (string, error) {
 	q.WriteString("]")
 
 	q.WriteString(`, "status": `)
-	s, _ := json.Marshal(defch)
-	q.WriteString(string(s))
+	s, e := json.Marshal(defch)
+	if e != nil {
+		q.WriteString(fmt.Sprintf(`{"error": "%s",}`, e))
+	} else {
+		q.WriteString(string(s))
+	}
 	
 	q.WriteString("}")
 	return q.String(), nil
@@ -761,6 +778,7 @@ func sendTo(id string, data *FeData) error {
 		return fmt.Errorf("Unknown id %s", id)
 	}
 	if p.Self {
+		connsLock.RUnlock()
 		return fmt.Errorf("%s is self", id)
 	}
 	c, err := p.getConn()

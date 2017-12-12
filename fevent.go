@@ -22,11 +22,17 @@ func FeventGetStringId() string {
 	return strconv.FormatUint(FeventGetId(), 10)
 }
 
+/*
 func FeventRegister(id interface{}, fn func(param, data interface{})error, param interface{}) {
 	var x []interface{}
 	x = append(append(x, fn), param)
 	_registry.Store(id, x)
 	//fmt.Printf("Event %s registered\n", id.(string))
+}
+*/
+
+func FeventRegister(id interface{}, fn func(interface{}) error) {
+	_registry.Store(id, fn)
 }
 
 func FeventUnregister(id interface{}) {
@@ -39,9 +45,8 @@ func FeventProcess(id, data interface{}) error {
 	if !ok {
 		return fmt.Errorf("No registered event found for %s!", id.(string))
 	} else {
-		x := _x.([]interface{})
-		f := x[0].(func(interface{}, interface{})error)
-		return f(x[1], data)
+		x := _x.(func(interface{})error)
+		return x(data)
 	}
 }
 

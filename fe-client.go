@@ -128,7 +128,8 @@ func FeClient() {
 		switch rsp.Type {
 		case "error":
 			fmt.Printf("Got error: %s/%s\n", rsp.Key, rsp.Value)
-		case "data":
+		case "data": fallthrough
+		case "committed":
 			fmt.Printf("%+v\n", rsp)
 		default:
 			fmt.Printf("Got unexpected data: %+v\n", rsp)
@@ -163,10 +164,12 @@ func FeClient() {
 			switch rsp.Type {
 			case "error":
 				fmt.Printf("Got error: %s/%s\n", rsp.Key, rsp.Value)
-			case "data":
-				//fmt.Printf("%+v\n", rsp)
+			case "data": fallthrough
+			case "committed":
+				fmt.Printf("%+v\n", rsp)
 			default:
 				fmt.Printf("Got unexpected data: %+v\n", rsp)
+				os.Exit(1)
 			}
 		}
 
