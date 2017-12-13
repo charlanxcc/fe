@@ -35,7 +35,6 @@
 package fe
 
 import (
-	_ "bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
@@ -44,8 +43,9 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
-	_ "reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -191,6 +191,24 @@ type FeData struct {
 	Channel		string		`json:"channel"`
 	State		string		`json:"state"`
 	Phase		uint64		`json:"phase"`
+	Index		uint64		`json:"index"`
+	Issuer		string		`json:"issuer"`
+	Key			string		`json:"key"`
+	Value		string		`json:"value"`
+	Timestamp	int64		`json:"timestamp"`
+	HoldUntil	int64		`json:"hold-until"`
+
+	next		*FeData		`json:"-"`
+	tracker		func(*FeData, string, error)	`json:"-"`
+}
+
+type FeTask struct {
+	Type		string		`json:"type"`
+	From		string		`json:"from"`
+	Channel		string		`json:"channel"`
+	State		string		`json:"state"`
+	Phase		uint64		`json:"phase"`
+
 	Index		uint64		`json:"index"`
 	Issuer		string		`json:"issuer"`
 	Key			string		`json:"key"`
@@ -811,6 +829,7 @@ func sendToPeers(peers []*Peer, data *FeData) {
 }
 
 func run(conf, id string) {
+
 	err := loadConfig(conf)
 	if err != nil {
 		fmt.Println(err)
@@ -832,6 +851,11 @@ func run(conf, id string) {
 		fmt.Printf("unknown id %s\n", id)
 		return
 	}
+
+	// http stack dumper
+	go func() {
+		fmt.Println(http.ListenAndServe(fmt.Sprintf("localhost:%d", me.Port + 10000), nil))
+	}()
 
 	defch.setPeers(me, peers)
 

@@ -1,5 +1,21 @@
 /* fecollator.go */
 
+
+/* TODO:
+  1. run next task after sync
+  2. yield
+  3. hold -> hold from the same
+    sync & retry
+  4. commit ahead from other
+    sync & retry
+  5. error behind or ahead
+    sync & retry
+
+
+  *. for debugging:
+    curl -L http://localhost:30004/debug/pprof/goroutine?debug=2
+*/
+
 /*
   init-------(sync req)---->syncing
      +-------(put req)----->proposing
@@ -45,7 +61,6 @@
   get <-> data, error
   hold <-> holding, errro
   commit <-> committed, holding, error
-  commit-full <-> committed, holding, error
   yield <-> yielded, error
   cancel <-> canceled, error
 
@@ -85,6 +100,8 @@ type FeCollator struct {
 	Tasks		chan *FeData	`json:"-"`
 
 	caretakers	map[uint64]*FeData
+	timeoutsLock *sync.Mutex
+	timeouts	map[uint64]*time.Timer
 }
 
 type FeCollatorSummary struct {
@@ -95,6 +112,7 @@ type FeCollatorSummary struct {
 	candidateCount	int
 	nReceived		int
 
+	needSync		bool
 	yieldRequest	*FeData		// the best valid yield request
 	commitRequest	*FeData		// the best valid commit request
 }
@@ -119,6 +137,8 @@ func NewFeCollator(channel string) *FeCollator {
 
 	fc.Tasks = make(chan *FeData, 128)
 	fc.caretakers = map[uint64]*FeData{}
+	fc.timeoutsLock = &sync.Mutex{}
+	fc.timeouts = map[uint64]*time.Timer{}
 
 	FeventRegister(fc.Channel, func(data interface{}) error {
 		return fc.proc(data.(*FeData), false)
@@ -223,8 +243,26 @@ func (fc *FeCollator) timeout(toms int, phase uint64, _type string) {
 	var to FeData
 	fc.prepData(&to, _type)
 	to.Phase = phase
-	time.Sleep(time.Duration(toms) * time.Millisecond)
-	fc.proc(&to, false)
+
+	fc.cancelTimeout(phase)
+	fc.timeoutsLock.Lock()
+	fc.timeouts[phase] = time.AfterFunc(time.Duration(toms) * time.Millisecond, func() {
+		fc.timeoutsLock.Lock()
+		delete(fc.timeouts, phase)
+		fc.timeoutsLock.Unlock()
+		fc.proc(&to, false)
+	})
+	fc.timeoutsLock.Unlock()
+}
+
+func (fc *FeCollator) cancelTimeout(phase uint64) {
+	fc.timeoutsLock.Lock()
+	defer fc.timeoutsLock.Unlock()
+	timer, ok := fc.timeouts[phase]
+	if ok {
+		delete(fc.timeouts, phase)
+		timer.Stop()
+	}
 }
 
 func (fc *FeCollator) sendToPeers(data *FeData) error {
@@ -243,7 +281,7 @@ func (fc *FeCollator) sendToPeers(data *FeData) error {
 			x.Phase = fc.Phase
 			fc.proc(&x, true)
 		} else {
-			fmt.Printf("  Sent to    %s %s/%d/%d\n", id, data.Type, data.Index, data.Phase)
+			//fmt.Printf("  Sent to    %s %s/%d/%d\n", id, data.Type, data.Index, data.Phase)
 		}
 /*
 		go func(id string) {
@@ -282,6 +320,11 @@ func (fc *FeCollator) collate(summary *FeCollatorSummary) {
 
 		if i.Phase == fc.Phase {
 			mm[i.From]++
+
+			if i.Type == "error" {
+				// TODO: check error code saying it's behind or something
+				summary.needSync = true
+			}
 		}
 
 		if fc.State == "proposing" && i.Type == "holding" {
@@ -360,11 +403,21 @@ func (fc *FeCollator) collate(summary *FeCollatorSummary) {
 
 	/* for yield, check count and hold-until */
 	/* for commit, check index */
+
+	//fmt.Printf("XXX: %+v\n", summary)
+}
+
+/* fc should be locked and state init */
+func (fc *FeCollator) syncAndGo(nextTask *FeData) error {
+	task := &FeData{}
+	fc.prepData(task, "sync")
+	task.next = nextTask
+	return fc.proc(task, true)
 }
 
 /* handles
 -- from local: put, sync, timeout, error
--- from remote: hold, commit-full, error
+-- from remote: hold, commit, error
  */
 func (fc *FeCollator) initProc(data *FeData) error {
 	var req FeData
@@ -440,11 +493,35 @@ func (fc *FeCollator) initProc(data *FeData) error {
 
 		ct := time.Now().UnixNano()
 		if data.Index <= fc.data.Index {
-			// obsolete
+			fc.prepError(&req, 2)
+			req.Issuer = data.Issuer
+			req.Channel = data.Channel
+			req.State = data.State
+			req.Phase = data.Phase
+			req.Index = data.Index
+			req.Value = "Index behind"
+			return sendTo(data.From, &req)
 		} else if data.Index > fc.data.Index + 1 {
-			// am i behind?
+			// am i behind? sync and go
+			fc.prepError(&req, 4)
+			req.Issuer = data.Issuer
+			req.Channel = data.Channel
+			req.State = data.State
+			req.Phase = data.Phase
+			req.Index = data.Index
+			req.Value = "Index ahead"
+			return sendTo(data.From, &req)
+			//return fc.syncAndGo(data)
 		} else if data.HoldUntil <= ct {
 			// it's expired already?
+			fc.prepError(&req, 3)
+			req.Issuer = data.Issuer
+			req.Channel = data.Channel
+			req.State = data.State
+			req.Phase = data.Phase
+			req.Index = data.Index
+			req.Value = "Wrong time"
+			return sendTo(data.From, &req)
 		} else {
 			// we're good
 
@@ -474,27 +551,6 @@ func (fc *FeCollator) initProc(data *FeData) error {
 	case "commit":
 		fmt.Printf("%s: Got obsolete commit: %+v\n", fc.me, data)
 		// maybe need to start syncing
-
-	case "commit-full":
-		fmt.Printf("%s ###: %+v\n", fc.me, data)
-
-		if data.Index != fc.data.Index + 1 {
-			fmt.Printf("Got out of sync commit-full: %+v\n", data)
-			// maybe need to start syncing
-		} else if data.Index == fc.data.Index + 1 {
-			data.HoldUntil = data.Timestamp
-			fc.setData(data)
-
-			req = *data
-			req.Type = "committed"
-			req.Key = ""
-			req.Value = ""
-
-			err := sendTo(data.From, &req)
-			fc.resetProposal()
-			fc.setState("init", true, true, true)
-			return err
-		}
 
 	default:
 		fmt.Printf("Got obsolete: %+v\n", data)
@@ -542,17 +598,7 @@ func (fc *FeCollator) syncingProc(data *FeData) error {
 			if fc.task.tracker != nil {
 				fc.task.tracker(summary.quorum, "done", nil)
 			}
-			fmt.Printf("Got quorum: %+v\n%+v\n", fc.data, summary)
-
-			if fc.task.next == nil {
-				fc.putCaretaker(fc.task)
-				fc.setState("init", true, true, true)
-			} else {
-				fc.putCaretaker(fc.task)
-				task := fc.task.next
-				fc.setState("init", true, true, false)
-				return fc.proc(task, true)
-			}
+			//fmt.Printf("Got quorum: %+v\n%+v\n", fc.data, summary)
 		} else {
 			if fc.task.tracker != nil {
 				var rsp FeData
@@ -560,10 +606,17 @@ func (fc *FeCollator) syncingProc(data *FeData) error {
 				rsp.Value = "Quorum not reached"
 				fc.task.tracker(&rsp, "canceled", nil)
 			}
-			fmt.Printf("Quorum not reached: %+v\n", summary)
+			//fmt.Printf("Quorum not reached: %+v\n", summary)
+		}
 
+		if fc.task.next == nil {
 			fc.putCaretaker(fc.task)
 			fc.setState("init", true, true, true)
+		} else {
+			fc.putCaretaker(fc.task)
+			task := fc.task.next
+			fc.setState("init", true, true, false)
+			return fc.proc(task, true)
 		}
 	}
 	return nil
@@ -583,7 +636,6 @@ func (fc *FeCollator) syncingProc(data *FeData) error {
     error
     yield
     commit
-    commit-full
     timeout
 */
 func (fc *FeCollator) proposingProc(data *FeData) error {
@@ -592,8 +644,10 @@ func (fc *FeCollator) proposingProc(data *FeData) error {
 	}
 
 	if data.Type != "timeout" {
+/*
 		fmt.Printf("  Got from   %s %s/%d/%d\n", data.From, data.Type,
 			data.Index, data.Phase)
+*/
 	}
 
 	done := false
@@ -601,7 +655,9 @@ func (fc *FeCollator) proposingProc(data *FeData) error {
 	case "timeout":
 		done = true
 
-	case "error": fallthrough
+	case "error":
+		fc.packets = append(fc.packets, data)
+
 	case "holding":
 		var ndata *FeData
 		if data.Issuer == fc.me {
@@ -642,6 +698,14 @@ func (fc *FeCollator) proposingProc(data *FeData) error {
 				fc.prepData(&ndata, "cancel")
 				fc.sendToPeers(&ndata)
 
+				fmt.Printf("quorum not reached, sync and go\n")
+
+				task := fc.task
+				fc.putCaretaker(fc.task)
+				fc.setState("init", true, true, false)
+				fc.syncAndGo(task)
+
+/*
 				if fc.task.tracker != nil {
 					fc.task.tracker(summary.quorum, "canceled", nil)
 				}
@@ -650,6 +714,7 @@ func (fc *FeCollator) proposingProc(data *FeData) error {
 				fc.setState("init", true, true, true)
 
 				fmt.Printf("quorum not reached\n")
+*/
 			} else {
 				/* cancel them */
 				var ndata FeData
@@ -663,7 +728,7 @@ func (fc *FeCollator) proposingProc(data *FeData) error {
 				fc.putCaretaker(fc.task)
 				fc.setState("init", true, true, true)
 
-				fmt.Printf("quorum not reached\n")
+				//fmt.Printf("quorum not reached\n")
 			}
 		} else {
 			/* commit them */
@@ -691,15 +756,17 @@ func (fc *FeCollator) proposingProc(data *FeData) error {
 	return nil
 }
 
-// committed, error, commit-full
+// committed, error
 func (fc *FeCollator) committingProc(data *FeData) error {
 	if data.Channel != fc.Channel {
 		return fmt.Errorf("wrong channel")
 	}
 
 	if data.Type != "timeout" {
+/*
 		fmt.Printf("  Got from   %s %s/%d/%d\n", data.From, data.Type,
 			data.Index, data.Phase)
+*/
 	}
 
 	done := false
@@ -715,10 +782,8 @@ func (fc *FeCollator) committingProc(data *FeData) error {
 		return nil
 
 	case "error":
-		if data.Phase != fc.Phase {
-			return nil
-		}
-		fallthrough
+		fc.packets = append(fc.packets, data)
+
 	case "committed":
 		var ndata *FeData
 		if data.Issuer == fc.me {
@@ -843,26 +908,6 @@ func (fc *FeCollator) statelessProc(data *FeData) error {
 		rsp.Phase = data.Phase
 		sendTo(data.From, &rsp)
 
-	case "commit-full":
-		if data.Index <= fc.data.Index {
-			fc.prepError(&rsp, 1)
-			rsp.Value = "wrong index"
-			rsp.Phase = data.Phase
-			sendTo(data.From, &rsp)
-		} else {
-			fc.prepData(&rsp, "committed")
-			rsp.Issuer = data.Issuer
-			rsp.Phase = data.Phase
-			sendTo(data.From, &rsp)
-
-			data.Type = "data"
-			data.State = "committed"
-			fc.setData(data)
-
-			if fc.State == "proposing" || fc.State == "holding" {
-				fc.setState("init", true, true, true)
-			}
-		}
 /*
 	case "status":
 		fc.prepData(&rsp, "data")
@@ -897,7 +942,6 @@ func (fc *FeCollator) proc(data *FeData, locked bool) error {
 	case "ping": fallthrough
 	case "pong": fallthrough
 	case "get": fallthrough
-	case "commit-full": fallthrough
 	case "status":
 		return fc.statelessProc(data)
 	}
@@ -959,13 +1003,17 @@ func (fc *FeCollator) takeAfter(task *FeData, data *FeData) error {
 
 	switch task.Type {
 	case "sync":
+/*
 		fmt.Printf("%s syncing/%d got %s from %s after\n", fc.me, task.Phase,
 			data.Type, data.From)
+*/
 	case "put":
+/*
 		if data.Type != "timeout" {
 			fmt.Printf("  After from %s %s/%d/%d\n", data.From, data.Type,
 				data.Index, data.Phase)
 		}
+*/
 		/*
 		fmt.Printf("%s putting/%d got %s from %s after\n", fc.me, task.Phase,
 			data.Type, data.From)

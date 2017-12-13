@@ -3,10 +3,14 @@
 DIR=${HOME}/src/fe
 LOGROT=logrot
 
+[ "$BIG" = "" ] && BIG=0
+[ "$BIG" = "0" ] && CONFIG=${DIR}/misc/fe-config.json || CONFIG=${DIR}/misc/fe-config-100.json
+[ "$BIG" = "0" ] && MAX=5 || MAX=100
+
 function start ()
 {
-    if [ ! -f ${DIR}/fe-config.json ]; then
-	echo "Cannot find fe-config.json"
+    if [ ! -f ${CONFIG} ]; then
+	echo "Cannot find ${CONFIG}"
 	return
     fi
 
@@ -14,15 +18,13 @@ function start ()
 	mkdir -p ${DIR}/build/logs
     fi
 
-    ${DIR}/build/bin/fe run ${DIR}/fe-config.json $1 2>&1 | ${LOGROT} ${DIR}/build/logs/$1.log 10M 5 &
+    ${DIR}/build/bin/fe run ${CONFIG} $1 2>&1 | ${LOGROT} ${DIR}/build/logs/$1.log 10M 5 &
 }
 
 function start_all ()
 {
-    LIST="id-1 id-2 id-3 id-4 id-5"
-
-    for i in ${LIST}; do
-	start $i
+    for ((i=1; i <= $MAX; i++)); do
+	start id-$i
     done
 }
 
@@ -39,17 +41,17 @@ case "$1" in
         ID=
     fi
     for i in {1..10}; do
-        ps axww | grep -v grep | grep -q "fe.*fe-config.json.*${ID}"
+        ps axww | grep -v grep | grep -q "fe.*fe-config.*json.*${ID}"
         if [ ! $? = 0 ]; then
             break
         else
-            ps axww | grep -v grep | grep "fe.*fe-config.json.*${ID}" | awk '{print $1}' | xargs -L1 sudo kill
-            sleep 3;
+            ps axww | grep -v grep | grep "fe.*fe-config.*json.*${ID}" | awk '{print $1}' | xargs -L1 sudo kill
+            sleep 1;
         fi
     done
-    ps axww | grep -v grep | grep -q "fe.*fe-config.json.*${ID}"
+    ps axww | grep -v grep | grep -q "fe.*fe-config.*json.*${ID}"
     if [ $? = 0 ]; then
-        ps axww | grep -v grep | grep "fe.*fe-config.json.*${ID}" | awk '{print $1}' | xargs -L1 sudo kill -9
+        ps axww | grep -v grep | grep "fe.*fe-config.*json.*${ID}" | awk '{print $1}' | xargs -L1 sudo kill -9
     fi
     ;;
 
