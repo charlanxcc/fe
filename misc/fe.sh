@@ -14,7 +14,7 @@ function start ()
 	mkdir -p ${DIR}/build/logs
     fi
 
-    ${DIR}/build/bin/fe run ${DIR}/fe-config.json $1 | ${LOGROT} ${DIR}/build/logs/$1.log 10M 5 &
+    ${DIR}/build/bin/fe run ${DIR}/fe-config.json $1 2>&1 | ${LOGROT} ${DIR}/build/logs/$1.log 10M 5 &
 }
 
 function start_all ()

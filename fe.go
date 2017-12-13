@@ -198,6 +198,7 @@ type FeData struct {
 	Timestamp	int64		`json:"timestamp"`
 	HoldUntil	int64		`json:"hold-until"`
 
+	next		*FeData		`json:"-"`
 	tracker		func(*FeData, string, error)	`json:"-"`
 }
 
