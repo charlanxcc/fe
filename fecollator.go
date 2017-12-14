@@ -305,82 +305,86 @@ func (fc *FeCollator) sendToPeers(data *FeData) error {
 }
 
 func (fc *FeCollator) collate(summary *FeCollatorSummary) {
-	var mine *FeData
-	if fc.State == "proposing" || fc.State == "committing" {
-		mine = fc.proposal
+	Id := func(d *FeData) string {
+		return fmt.Sprintf("%s.%d", d.Issuer, d.Index)
 	}
 
-	// id string -> { data *FeData, count int }
-	m := map[string][2]interface{}{}
-	// id string -> count int
-	mm := map[string]int{}
+	var mine *FeData
+	var mid string
+	if fc.State == "proposing" || fc.State == "committing" {
+		mine = fc.proposal
+		mid = Id(mine)
+	}
+
+	type Aggregate struct {
+		data	*FeData
+		count	int
+	}
+
+	// data-id string -> *Aggregate
+	ma := map[string]*Aggregate{}
+	// peer-id string -> *FeData: the latest packet
+	mp := map[string]*FeData{}
 
 	for _, i := range fc.packets {
 		valid := false
 
 		if i.Phase == fc.Phase {
-			mm[i.From]++
-
+			mp[i.From] = i
 			if i.Type == "error" {
 				// TODO: check error code saying it's behind or something
 				summary.needSync = true
 			}
 		}
 
-		if fc.State == "proposing" && i.Type == "holding" {
-			if fc.me != i.Issuer ||
-				(fc.me == i.Issuer && fc.proposal.Index == i.Index &&
-				fc.Phase == i.Phase) {
-				valid = true
-			}
-		} else if fc.State == "committing" && i.Type == "committed" {
-			if fc.me != i.Issuer ||
-				(fc.me == i.Issuer && fc.proposal.Index == i.Index &&
-				fc.Phase == i.Phase) {
-				valid = true
-			}
-		} else if fc.State == "syncing" && i.Type == "data" &&
+		if fc.State == "syncing" && i.Type == "data" &&
 			fc.Phase == i.Phase {
 			valid = true
+		} else if (fc.State == "proposing" && i.Type == "holding") ||
+			(fc.State == "committing" && i.Type == "committed") {
+			if fc.me != i.Issuer ||
+				(fc.me == i.Issuer && fc.proposal.Index == i.Index &&
+				fc.Phase == i.Phase) {
+				valid = true
+			}
 		}
 
 		if !valid {
 			continue
 		}
 
-		id := i.Id()
-		v, ok := m[id]
+		id := Id(i)
+		v, ok := ma[id]
 		if ok {
-			*v[1].(*int) += 1
+			v.count++
 		} else {
-			var ii = 1
-			w := [2]interface{}{i, &ii}
-			m[id] = w
+			v := &Aggregate{count: 1}
+			if id == mid {
+				v.data = mine
+			} else {
+				v.data = i
+			}
+			ma[id] = v
 		}
 	}
 
-	var mid string = ""
-	if mine != nil {
-		mid = mine.Id()
-	}
-
-	x, ok := m[mid]
+	v, ok := ma[mid]
 	if !ok {
-		summary.myCount = 0;
+		summary.myCount = 0
 	} else {
-		summary.myCount = *x[1].(*int)
+		summary.myCount = v.count
 	}
 
 	var q, o *FeData
 	var qn, on int = 0, 0
-	for i, j := range m {
-		if q == nil || *j[1].(*int) > qn {
-			q  = j[0].(*FeData)
-			qn = *j[1].(*int)
+	for i, j := range ma {
+		if q == nil || j.count > qn {
+			q  = j.data
+			qn = j.count
 		}
-		if i != mid && (o == nil || *j[1].(*int) > on) {
-			o  = j[0].(*FeData)
-			on = *j[1].(*int)
+		if i != mid && (o == nil || j.count > on) {
+			o  = j.data
+			on = j.count
 		}
 	}
 
@@ -395,7 +399,7 @@ func (fc *FeCollator) collate(summary *FeCollatorSummary) {
 		on = 0
 	}
 
-	summary.nReceived      = len(mm)
+	summary.nReceived      = len(mp)
 	summary.quorum         = q
 	summary.quorumCount    = qn
 	summary.candidate      = o
@@ -655,19 +659,9 @@ func (fc *FeCollator) proposingProc(data *FeData) error {
 	case "timeout":
 		done = true
 
-	case "error":
-		fc.packets = append(fc.packets, data)
-
+	case "error": fallthrough
 	case "holding":
-		var ndata *FeData
-		if data.Issuer == fc.me {
-			ndata = &FeData{}
-			*ndata = *fc.proposal
-			ndata.From = data.From
-		} else {
-			ndata = data
-		}
-		fc.packets = append(fc.packets, ndata)
+		fc.packets = append(fc.packets, data)
 
 	case "yield":
 		// ignore for now
@@ -781,20 +775,9 @@ func (fc *FeCollator) committingProc(data *FeData) error {
 		// ignore
 		return nil
 
-	case "error":
-		fc.packets = append(fc.packets, data)
-
+	case "error": fallthrough
 	case "committed":
-		var ndata *FeData
-		if data.Issuer == fc.me {
-			ndata = &FeData{}
-			*ndata = *fc.data
-			ndata.From = data.From
-			ndata.Type = data.Type
-		} else {
-			ndata = data
-		}
-		fc.packets = append(fc.packets, ndata)
+		fc.packets = append(fc.packets, data)
 
 	default:
 		fmt.Printf("%s XXX: %+v\n", fc.me, data)
