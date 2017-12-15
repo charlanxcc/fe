@@ -69,6 +69,7 @@
 package fe
 
 import (
+	"bytes"
 	"fmt"
 	"strconv"
 	"sync"
@@ -105,16 +106,23 @@ type FeCollator struct {
 }
 
 type FeCollatorSummary struct {
+	target			int
+	nSent			int
+	nReceived		int
+
+	done			bool
+
 	myCount			int
 	quorum			*FeData
 	quorumCount		int
 	candidate		*FeData
 	candidateCount	int
-	nReceived		int
 
 	needSync		bool
 	yieldRequest	*FeData		// the best valid yield request
 	commitRequest	*FeData		// the best valid commit request
+
+	summary			string
 }
 
 var (
@@ -169,26 +177,64 @@ func (fc *FeCollator) setData(data *FeData) {
 	*fc.data = *data
 }
 
-func (fc *FeCollator) prepData(data *FeData, _type string) *FeData {
-	data.Type = _type
-	data.From = fc.me
-	data.Channel = fc.Channel
-	data.State = fc.State
-	data.Phase = fc.Phase
-	data.Index = fc.data.Index
-	data.Issuer = fc.me
-	return data
+func (fc *FeCollator) _prep(dst *FeData, src *FeData, _type string, err int) {
+	if src != nil {
+		dst.Type = src.Type
+		dst.From = src.From
+		dst.Channel = src.Channel
+		dst.State = src.State
+		dst.Phase = src.Phase
+		dst.Index = src.Index
+		dst.Issuer = src.Issuer
+		dst.Timestamp = src.Timestamp
+		dst.HoldUntil = src.HoldUntil
+	} else {
+		dst.Type = _type
+		dst.From = fc.me
+		dst.Channel = fc.Channel
+		dst.State = fc.State
+		dst.Phase = fc.Phase
+		dst.Index = fc.data.Index
+		dst.Issuer = fc.me
+	}
+
+	if _type != "" {
+		dst.Type = _type
+	}
+	if _type == "error" {
+		dst.Key = strconv.Itoa(err)
+		dst.Value = "error"
+	}
 }
 
-func (fc *FeCollator) prepError(data *FeData, err int) *FeData {
-	data.Type = "error"
-	data.From = fc.me
-	data.Channel = fc.Channel
-	data.State = fc.State
-	data.Phase = fc.Phase
-	data.Key = strconv.Itoa(err)
-	data.Value = "error"
-	return data
+func (fc *FeCollator) prep(_type string) *FeData {
+	var r FeData
+
+	switch _type {
+	case "get":			fallthrough
+	case "put":			fallthrough
+	case "sync":
+		fc._prep(&r, nil, _type, 0)
+
+	case "hold":		fallthrough
+	case "holding":		fallthrough
+	case "commit":		fallthrough
+	case "committed":	fallthrough
+	case "cancel":		fallthrough
+	case "canceled":
+		fc._prep(&r, fc.proposal, _type, 0)
+
+	case "timeout":		fallthrough
+	case "fin":
+		fc._prep(&r, fc.proposal, _type, 0)
+	}
+	return &r
+}
+
+func (fc *FeCollator) prepError(src *FeData, err int) *FeData {
+	var r FeData
+	fc._prep(&r, src, "error", err)
+	return &r
 }
 
 func (fc *FeCollator) setState(state string, phaseShift, resetPackets bool, pickupTask bool) {
@@ -201,10 +247,16 @@ func (fc *FeCollator) setState(state string, phaseShift, resetPackets bool, pick
 		fc.packets = nil
 	}
 
-	fmt.Printf("%s %s/%d/%d\n", fc.me, fc.State, fc.data.Index, fc.Phase)
+	index := fc.data.Index
+	if state == "proposing" || state == "committing" {
+		index++
+	} else if state == "holding" {
+		index = fc.proposal.Index
+	}
+	fmt.Printf("%s %s/%d/%d\n", fc.me, fc.State, index, fc.Phase)
 
 	if state == "init" && pickupTask {
-		fc.pickup(true)
+		go fc.pickup(true)
 	}
 }
 
@@ -216,7 +268,8 @@ func (fc *FeCollator) pickup(locked bool) {
 	if fc.State == "init" {
 		select {
 		case task := <- fc.Tasks:
-			go fc.proc(task, false)
+			fmt.Printf("### task: %s/%s\n", task.Type, task.Key)
+			fc.proc(task, true)
 		default:
 			fc.task = nil
 		}
@@ -236,13 +289,13 @@ func (fc *FeCollator) timeout(toms int, phase uint64, _type string) {
 	if _type == "" {
 		_type = "timeout"
 	}
-	if phase == 0 {
-		phase = fc.Phase
-	}
 
-	var to FeData
-	fc.prepData(&to, _type)
-	to.Phase = phase
+	to := fc.prep(_type)
+	if phase != 0 {
+		to.Phase = phase
+	} else {
+		to.Phase = fc.Phase
+	}
 
 	fc.cancelTimeout(phase)
 	fc.timeoutsLock.Lock()
@@ -250,7 +303,7 @@ func (fc *FeCollator) timeout(toms int, phase uint64, _type string) {
 		fc.timeoutsLock.Lock()
 		delete(fc.timeouts, phase)
 		fc.timeoutsLock.Unlock()
-		fc.proc(&to, false)
+		fc.proc(to, false)
 	})
 	fc.timeoutsLock.Unlock()
 }
@@ -399,11 +452,46 @@ func (fc *FeCollator) collate(summary *FeCollatorSummary) {
 		on = 0
 	}
 
+	summary.target         = fc.target
+	summary.nSent          = int(fc.nSent)
 	summary.nReceived      = len(mp)
 	summary.quorum         = q
 	summary.quorumCount    = qn
 	summary.candidate      = o
 	summary.candidateCount = on
+
+	if summary.quorum != nil || summary.nReceived >= summary.nSent {
+		summary.done = true
+	}
+
+	{
+		sb := &bytes.Buffer{}
+		fmt.Fprintf(sb, "%d: %d/%d/%d: [", fc.Phase, summary.nSent,
+			summary.target, summary.nReceived)
+		space := ""
+		for i, j := range ma {
+			fmt.Fprintf(sb, "%s%s:%d", space, i, j.count)
+			space = " "
+		}
+		fmt.Fprintf(sb, "] [")
+		space = ""
+		for i, j := range mp {
+			fmt.Fprintf(sb, "%s%s:%s", space, i, j.Type)
+			space = " "
+		}
+		fmt.Fprintf(sb, "]")
+
+		fmt.Fprintf(sb, " [")
+		space = ""
+		for _, j := range fc.packets {
+			fmt.Fprintf(sb, "%s%s:%s/%s/%d/%d/%d", space, j.From, j.Type,
+				j.Issuer, j.Index, j.Phase, j.Timestamp)
+			space = " "
+		}
+		fmt.Fprintf(sb, "]")
+
+		summary.summary = sb.String()
+	}
 
 	/* for yield, check count and hold-until */
 	/* for commit, check index */
@@ -413,8 +501,7 @@ func (fc *FeCollator) collate(summary *FeCollatorSummary) {
 
 /* fc should be locked and state init */
 func (fc *FeCollator) syncAndGo(nextTask *FeData) error {
-	task := &FeData{}
-	fc.prepData(task, "sync")
+	task := fc.prep("sync")
 	task.next = nextTask
 	return fc.proc(task, true)
 }
@@ -452,7 +539,7 @@ func (fc *FeCollator) initProc(data *FeData) error {
 
 		fc.setProposal(&data3)
 
-		go fc.timeout(fc.Timeout, 0, "")
+		fc.timeout(fc.Timeout, 0, "")
 		//atomic.AddInt32(&fc.nSent, int32(len(fc.peers)))
 		fc.nSent = int32(len(fc.peers))
 		fc.proc(&data3, true)
@@ -467,9 +554,9 @@ func (fc *FeCollator) initProc(data *FeData) error {
 
 		fc.task = data
 		fc.setState("syncing", true, true, false)
-		fc.prepData(&req, "get")
-		req.Timestamp = time.Now().UnixNano()
-		req.HoldUntil = req.Timestamp
+		q := fc.prep("get")
+		q.Timestamp = time.Now().UnixNano()
+		q.HoldUntil = req.Timestamp
 
 		var ldata FeData
 		ldata = *fc.data
@@ -477,11 +564,11 @@ func (fc *FeCollator) initProc(data *FeData) error {
 		ldata.From = fc.me
 		ldata.Phase = fc.Phase
 
-		go fc.timeout(fc.Timeout, 0, "")
+		fc.timeout(fc.Timeout, 0, "")
 		//atomic.AddInt32(&fc.nSent, len(fc.peers))
 		fc.nSent = int32(len(fc.peers))
 		fc.proc(&ldata, true)
-		fc.sendToPeers(&req)
+		fc.sendToPeers(q)
 
 	case "timeout":
 		// ignore
@@ -497,51 +584,30 @@ func (fc *FeCollator) initProc(data *FeData) error {
 
 		ct := time.Now().UnixNano()
 		if data.Index <= fc.data.Index {
-			fc.prepError(&req, 2)
-			req.Issuer = data.Issuer
-			req.Channel = data.Channel
-			req.State = data.State
-			req.Phase = data.Phase
-			req.Index = data.Index
-			req.Value = "Index behind"
-			return sendTo(data.From, &req)
+			q := fc.prepError(data, 2)
+			q.From = fc.me
+			q.Value = "Index behind"
+			return sendTo(data.From, q)
 		} else if data.Index > fc.data.Index + 1 {
-			// am i behind? sync and go
-			fc.prepError(&req, 4)
-			req.Issuer = data.Issuer
-			req.Channel = data.Channel
-			req.State = data.State
-			req.Phase = data.Phase
-			req.Index = data.Index
-			req.Value = "Index ahead"
-			return sendTo(data.From, &req)
-			//return fc.syncAndGo(data)
+			// am i behind? sync and go, maybe?
+			q := *data
+			return fc.syncAndGo(&q)
 		} else if data.HoldUntil <= ct {
 			// it's expired already?
-			fc.prepError(&req, 3)
-			req.Issuer = data.Issuer
-			req.Channel = data.Channel
-			req.State = data.State
-			req.Phase = data.Phase
-			req.Index = data.Index
-			req.Value = "Wrong time"
-			return sendTo(data.From, &req)
+			q := fc.prepError(data, 3)
+			q.From = fc.me
+			q.Value = "Expired"
+			return sendTo(data.From, q)
 		} else {
 			// we're good
 
-			fc.setState("holding", true, true, false)
 			fc.setProposal(data)
+			fc.setState("holding", true, true, false)
 
-			fc.prepData(&req, "holding")
-			req.Issuer = data.Issuer
-			req.Channel = data.Channel
-			req.State = data.State
-			req.Phase = data.Phase
-			req.Index = data.Index
-
-			err := sendTo(data.From, &req)
+			q := fc.prep("holding")
+			err := sendTo(data.From, q)
 			if err == nil {
-				go fc.timeout(int((data.HoldUntil - ct) / 1000), 0, "")
+				fc.timeout(int((data.HoldUntil - ct) / 1000), 0, "")
 			}
 			return err
 		}
@@ -584,15 +650,8 @@ func (fc *FeCollator) syncingProc(data *FeData) error {
 
 	var summary FeCollatorSummary
 	fc.collate(&summary)
-
-	if !done && summary.nReceived >= int(fc.nSent) {
-		done = true
-		fc.collate(&summary)
-	} else if summary.nReceived >= fc.target {
-		fc.collate(&summary)
-		if summary.quorum != nil {
-			done = true
-		}
+	if !done {
+		done = summary.done
 	}
 
 	if done {
@@ -605,10 +664,9 @@ func (fc *FeCollator) syncingProc(data *FeData) error {
 			//fmt.Printf("Got quorum: %+v\n%+v\n", fc.data, summary)
 		} else {
 			if fc.task.tracker != nil {
-				var rsp FeData
-				fc.prepError(&rsp, 1)
-				rsp.Value = "Quorum not reached"
-				fc.task.tracker(&rsp, "canceled", nil)
+				q := fc.prepError(nil, 1)
+				q.Value = "Quorum not reached"
+				fc.task.tracker(q, "canceled", nil)
 			}
 			//fmt.Printf("Quorum not reached: %+v\n", summary)
 		}
@@ -659,12 +717,41 @@ func (fc *FeCollator) proposingProc(data *FeData) error {
 	case "timeout":
 		done = true
 
+	case "hold":
+		q := fc.prep("holding")
+		q.From = fc.me
+		q.State = fc.proposal.State
+		q.Phase = data.Phase
+		err := sendTo(data.From, q)
+		if err != nil {
+			fmt.Printf("Failed to send to %s: %s\n", data.From, err)
+		}
+
 	case "error": fallthrough
 	case "holding":
 		fc.packets = append(fc.packets, data)
 
 	case "yield":
 		// ignore for now
+
+	case "commit":
+		if data.Index < fc.proposal.Index {
+			fmt.Printf("%s Got obsolete commit from %s for %d vs. %d\n",
+				fc.me, data.From, data.Index, fc.proposal.Index)
+		} else if data.Index >= fc.proposal.Index {
+			fmt.Printf("%s Got commit from %s for %d vs. %d, sync and go.\n",
+				fc.me, data.From, data.Index, fc.proposal.Index)
+
+			q := fc.prep("cancel")
+			q.From = fc.me
+			fc.sendToPeers(q)
+
+			task := fc.task
+			fc.putCaretaker(fc.task)
+			fc.setState("init", true, true, false)
+			fc.syncAndGo(task)
+			return nil
+		}
 
 	default:
 		fmt.Printf("%s XXX: %+v\n", fc.me, data)
@@ -674,23 +761,21 @@ func (fc *FeCollator) proposingProc(data *FeData) error {
 	var summary FeCollatorSummary
 	fc.collate(&summary)
 
-	if !done && summary.nReceived >= int(fc.nSent) {
-		done = true
-		fc.collate(&summary)
-	} else if summary.nReceived >= fc.target {
-		fc.collate(&summary)
-		if summary.quorum != nil {
-			done = true
-		}
+	if done {
+		fmt.Println("###", summary.summary)
+	}
+
+	if !done {
+		done = summary.done
 	}
 
 	if done {
 		if summary.myCount < fc.target {
 			if true {
 				/* sync and try again */
-				var ndata FeData
-				fc.prepData(&ndata, "cancel")
-				fc.sendToPeers(&ndata)
+				q := fc.prep("cancel")
+				q.From = fc.me
+				fc.sendToPeers(q)
 
 				fmt.Printf("quorum not reached, sync and go\n")
 
@@ -711,9 +796,9 @@ func (fc *FeCollator) proposingProc(data *FeData) error {
 */
 			} else {
 				/* cancel them */
-				var ndata FeData
-				fc.prepData(&ndata, "cancel")
-				fc.sendToPeers(&ndata)
+				q := fc.prep("cancel")
+				q.From = fc.me
+				fc.sendToPeers(q)
 
 				if fc.task.tracker != nil {
 					fc.task.tracker(summary.quorum, "canceled", nil)
@@ -786,15 +871,8 @@ func (fc *FeCollator) committingProc(data *FeData) error {
 
 	var summary FeCollatorSummary
 	fc.collate(&summary)
-
-	if !done && summary.nReceived >= int(fc.nSent) {
-		done = true
-		fc.collate(&summary)
-	} else if summary.nReceived >= fc.target {
-		fc.collate(&summary)
-		if summary.quorum != nil {
-			done = true
-		}
+	if !done {
+		done = summary.done
 	}
 
 	if done {
@@ -822,21 +900,40 @@ func (fc *FeCollator) committingProc(data *FeData) error {
 
 // commit, cancel
 func (fc *FeCollator) holdingProc(data *FeData) error {
-	var rsp FeData
-
 	if data.Channel != fc.Channel {
 		return fmt.Errorf("wrong channel")
 	}
 
 	switch data.Type {
+	case "hold":
+		if data.From == data.Issuer && data.Issuer == fc.proposal.Issuer &&
+			data.Index > fc.proposal.Index {
+			// hold this one instead
+			fc.setProposal(data)
+			fc.setState("holding", true, true, false)
+			q := fc.prep("holding")
+			q.From = fc.me
+			_ = sendTo(data.From, q)
+		} else if data.Issuer != fc.proposal.Issuer {
+			// send "holding" message
+			q := fc.prep("holding")
+			q.From = fc.me
+			q.Phase = data.Phase
+			_ = sendTo(data.From, q)
+		} else {
+			fmt.Printf("Got obsolete hold: hold=%+v, proposal=%+v\n",
+				data, fc.proposal)
+		}
+
 	case "commit":
 		if data.From == data.Issuer && data.Issuer == fc.proposal.Issuer &&
 			data.Index == fc.proposal.Index {
-			fc.prepData(&rsp, "committed")
-			rsp.Index = fc.proposal.Index
-			rsp.Issuer = data.Issuer
-			rsp.Phase = data.Phase
-			sendTo(data.From, &rsp)
+			q := fc.prep("committed")
+			q.From = fc.me
+			err := sendTo(data.From, q)
+			if err != nil {
+				fmt.Printf("Failed to send to %s: %s\n", data.From, err)
+			}
 
 			x := fc.proposal
 			fc.resetProposal()
@@ -846,6 +943,9 @@ func (fc *FeCollator) holdingProc(data *FeData) error {
 			fc.setData(x)
 
 			fc.setState("init", true, true, true)
+		} else if data.Index > fc.proposal.Index {
+			fmt.Printf("%s: in %s, got commit ahead, ignoring for now %+v, %+v\n",
+				fc.me, fc.State, data, fc.proposal)
 		} else {
 			fmt.Printf("%s: in %s, ignoring %+v, %+v\n", fc.me, fc.State,
 				data, fc.proposal)
@@ -854,10 +954,12 @@ func (fc *FeCollator) holdingProc(data *FeData) error {
 	case "cancel":
 		if data.From == data.Issuer && data.Issuer == fc.proposal.Issuer &&
 			data.Index == fc.proposal.Index {
-			fc.prepData(&rsp, "canceled")
-			rsp.Issuer = data.Issuer
-			rsp.Phase = data.Phase
-			sendTo(data.From, &rsp)
+			q := fc.prep("canceled")
+			q.From = fc.me
+			err := sendTo(data.From, q)
+			if err != nil {
+				fmt.Printf("Failed to send to %s: %s\n", data.From, err)
+			}
 
 			fc.resetProposal()
 			fc.setState("init", true, true, true)
@@ -906,6 +1008,10 @@ func (fc *FeCollator) proc(data *FeData, locked bool) error {
 	if !locked {
 		fc.Lock()
 		defer fc.Unlock()
+	}
+
+	if data.Type == "put" && fc.State != "init" {
+		panic(fmt.Sprintf("state=%s", fc.State))
 	}
 
 	if fc.State == "holding" {
@@ -1011,12 +1117,12 @@ func (fc *FeCollator) putCaretaker(task *FeData) {
 	caretaker = *task
 	caretaker.Phase = fc.Phase
 	fc.caretakers[caretaker.Phase] = &caretaker
-	go fc.timeout(fc.Timeout, caretaker.Phase, "fin")
+	fc.timeout(fc.Timeout, caretaker.Phase, "fin")
 }
 
 func (fc *FeCollator) putTask(task *FeData) error {
 	fc.Tasks <- task
-	fc.pickup(false)
+	go fc.pickup(false)
 	return nil
 }
 

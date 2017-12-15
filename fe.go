@@ -441,12 +441,13 @@ func (p *Peer) sendJson(data interface{}) error {
 }
 
 func (p *Peer) peerHandler(peer *Peer, conn net.Conn) {
-	var req FeData
+	var req *FeData
 	var err error
 
 	/* p is me, peer is the peer */
 	for {
-		err = recvJson(conn, &req)
+		req = new(FeData)
+		err = recvJson(conn, req)
 		if err != nil {
 			if err == io.EOF {
 				//log.Printf("Connection from %s closed.\n", peer.Id)
@@ -458,17 +459,19 @@ func (p *Peer) peerHandler(peer *Peer, conn net.Conn) {
 		}
 
 		req.From = peer.Id
-		err = FeventProcessData(&req)
+		err = FeventProcessData(req)
 	}
 }
 
 func (p *Peer) clientHandler(client *Client, conn net.Conn) {
-	var req, rsp FeData
+	var req *FeData
+	var rsp FeData
 	var err error
 
 	/* p is me, client is the client */
 	for {
-		err = recvJson(conn, &req)
+		req = new(FeData)
+		err = recvJson(conn, req)
 		if err != nil {
 			if err == io.EOF {
 				//log.Printf("Connection from %s closed.\n", client.Id)
@@ -483,20 +486,21 @@ func (p *Peer) clientHandler(client *Client, conn net.Conn) {
 		case "sync":
 			req.From = me.Id
 			req.tracker = func(data *FeData, state string, err error) {
-				rsp = req
+				rsp := *req
 				rsp.State = state
 				switch state {
 				case "done": fallthrough
 				case "canceled":
-					e2 := sendJson(conn, &rsp)
+					e2 := sendJson(conn, rsp)
 					if e2 != nil {
 						fmt.Printf("failed to send to %s: %s\n", client.Id, e2)
 					}
 				}
 			}
-			defch.putTask(&req)
+			defch.putTask(req)
 
 		case "get":
+			// TODO: need safe fetch
 			err = sendJson(conn, defch.data)
 			if err != nil {
 				fmt.Printf("failed to send to %s: %s\n", client.Id, err)
@@ -506,7 +510,7 @@ func (p *Peer) clientHandler(client *Client, conn net.Conn) {
 		case "put":
 			req.From = me.Id
 			req.tracker = func(data *FeData, state string, err error) {
-				rsp = req
+				rsp := *req
 				rsp.State = state
 				switch state {
 				case "committed": fallthrough
@@ -517,12 +521,12 @@ func (p *Peer) clientHandler(client *Client, conn net.Conn) {
 					}
 				}
 			}
-			defch.putTask(&req)
+			defch.putTask(req)
 
 		case "status":
 			rsp.Type = "data"
 			rsp.Value, _ = status()
-			err = sendJson(conn, rsp)
+			err = sendJson(conn, &rsp)
 			if err != nil {
 				fmt.Printf("failed to send to %s: %s\n", client.Id, err)
 				return
@@ -531,7 +535,7 @@ func (p *Peer) clientHandler(client *Client, conn net.Conn) {
 			rsp.Type = "error"
 			rsp.Key = "1"
 			rsp.Value = "Unknown request type"
-			err = sendJson(conn, rsp)
+			err = sendJson(conn, &rsp)
 			if err != nil {
 				fmt.Printf("failed to send to %s: %s\n", client.Id, err)
 				return
