@@ -683,6 +683,16 @@ func status() (string, error) {
 	} else {
 		q.WriteString(string(s))
 	}
+
+	var sum FeCollatorSummary
+	defch.collate(&sum)
+	q.WriteString(`, "collator": `)
+	s, e = json.Marshal(sum.summary)
+	if e != nil {
+		q.WriteString(fmt.Sprintf(`{"error": "%s",}`, e))
+	} else {
+		q.WriteString(string(s))
+	}
 	
 	q.WriteString("}")
 	return q.String(), nil
