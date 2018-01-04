@@ -1,10 +1,10 @@
 #!/bin/bash
 
-DIR=${HOME}/src/fe
+[ "$FE_DIR" = "" ] && FE_DIR=${HOME}/src/fe
 LOGROT=logrot
 
 [ "$BIG" = "" ] && BIG=0
-[ "$BIG" = "0" ] && CONFIG=${DIR}/misc/fe-config.json || CONFIG=${DIR}/misc/fe-config-100.json
+[ "$BIG" = "0" ] && CONFIG=${FE_DIR}/misc/fe-config.json || CONFIG=${FE_DIR}/misc/fe-config-100.json
 [ "$BIG" = "0" ] && MAX=5 || MAX=100
 
 function start ()
@@ -14,11 +14,11 @@ function start ()
 	return
     fi
 
-    if [ ! -d ${DIR}/build/logs ]; then
-	mkdir -p ${DIR}/build/logs
+    if [ ! -d ${FE_DIR}/build/logs ]; then
+	mkdir -p ${FE_DIR}/build/logs
     fi
 
-    ${DIR}/build/bin/fe run ${CONFIG} $1 2>&1 | ${LOGROT} ${DIR}/build/logs/$1.log 10M 5 &
+    ${FE_DIR}/build/bin/fe run ${CONFIG} $1 2>&1 | ${LOGROT} ${FE_DIR}/build/logs/$1.log 10M 5 &
 }
 
 function start_all ()
