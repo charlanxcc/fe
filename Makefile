@@ -7,8 +7,14 @@ all: build build/bin/fe
 
 .PHONY: build/bin/fe clean
 
+MACFW=/usr/libexec/ApplicationFirewall/socketfilterfw
+
 build/bin/fe:
-	GOPATH=${PWD}/build go build -o $@ cmd/fe-main.go 
+	GOPATH=${PWD}/build go build -o $@ cmd/fe-main.go;
+	@if [ $$? = 0 -a -x ${MACFW} ]; then \
+		sudo ${MACFW} --remove ${PWD}/$@ > /dev/null 2>&1; \
+		sudo ${MACFW} --add ${PWD}/$@ > /dev/null 2>&1; \
+	fi
 
 build: 
 	@if [ ! -d build ]; then				\
